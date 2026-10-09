@@ -1,0 +1,25 @@
+# OS & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs & Temporary files
+*.log
+scratch/
+tmp/
+.temp/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Dependencies & Build artifacts (for future modules)
+node_modules/
+dist/
+build/
+.next/
+bin/
