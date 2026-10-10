@@ -8,12 +8,13 @@ Dokumen ini mendokumentasikan keputusan arsitektural penting (Architecture Decis
 ## Daftar Isi ADR
 
 - [ADR-001: Strategi Penyimpanan Ganda (Dual-Storage Architecture: Time-Series & Graph Database)](#adr-001-strategi-penyimpanan-ganda-dual-storage-architecture)
-- [ADR-002: Protokol Pengumpulan Data Bertingkat (gNMI Streaming Telemetry, SNMP Gateway, dan eBPF)](#adr-002-protokol-pengumpulan-data-bertingkat)
+- [ADR-002: Protokol Pengumpulan Data Bertingkat (gNMI Streaming Telemetry, SNMP Gateway, dan eBPF Berbasis Rust)](#adr-002-protokol-pengumpulan-data-bertingkat)
 - [ADR-003: Pipeline Ingesti dan Message Streaming Backbone (Apache Kafka & Vector)](#adr-003-pipeline-ingesti-dan-message-streaming-backbone)
-- [ADR-004: Otomasi Konfigurasi Deklaratif dan Pemulihan Mandiri Berbasis GitOps (Temporal Engine)](#adr-004-otomasi-konfigurasi-deklaratif-dan-gitops)
+- [ADR-004: Otomasi Konfigurasi Deklaratif dan Pemulihan Mandiri Berbasis GitOps (Temporal Engine & Rust SDK)](#adr-004-otomasi-konfigurasi-deklaratif-dan-gitops)
 - [ADR-005: Korelasi Alarm dan Root Cause Analysis (RCA) Berbasis Graf Dependensi AIOps](#adr-005-korelasi-alarm-dan-root-cause-analysis-aiops)
 - [ADR-006: Arsitektur Antarmuka Visualisasi Topologi Skala Besar Berbasis WebGL](#adr-006-arsitektur-antarmuka-visualisasi-topologi-webgl)
 - [ADR-007: Autentikasi Mandiri Berbasis Basis Data (Internal / Custom Database-Backed Auth)](#adr-007-autentikasi-mandiri-berbasis-basis-data-internal-custom-auth)
+- [ADR-008: Standarisasi Bahasa Backend, Layanan Ingesti, dan Engine Inti Menggunakan Rust](#adr-008-standarisasi-bahasa-backend-dan-engine-ingesti-menggunakan-rust)
 
 ---
 
@@ -75,17 +76,18 @@ Jika hanya mengandalkan SNMP, MTTD akan tertahan di rentang 5–15 menit. Jika h
 
 ### 3. Keputusan
 Memilih **Opsi B**: Mengimplementasikan **Tiered Telemetry Ingestion Pipeline**:
-1. **gNMI over gRPC (OpenConfig)**: Sebagai protokol prioritas utama untuk streaming data antarmuka, status BGP, dan counter trafik secara kontinu.
-2. **SNMP v3 / Flow Ingestion Gateway**: Berfungsi sebagai adapter kompatibilitas untuk perangkat warisan, menggunakan polling adaptif (heartbeat ringan per 5 detik, metrik berat per 5 menit) dan SNMP Traps / Syslog.
-3. **eBPF DaemonSet / Agent**: Menginjeksi probe observabilitas ke Linux kernel untuk melacak throughput socket, RTT, dan penurunan paket intra-host.
+1. **gNMI over gRPC (OpenConfig)**: Sebagai protokol prioritas utama untuk streaming data antarmuka, status BGP, dan counter trafik secara kontinu menggunakan klien gRPC asinkron berbasis Rust (`tonic` & `prost`).
+2. **SNMP v3 / Flow Ingestion Gateway**: Berfungsi sebagai adapter kompatibilitas untuk perangkat warisan, menggunakan polling adaptif (heartbeat ringan per 5 detik, metrik berat per 5 menit), SNMP Traps / Syslog, dan zero-copy packet parser (`rasn-snmp`, `netflow-parser`, `nom`).
+3. **eBPF DaemonSet / Agent**: Menginjeksi probe observabilitas ke Linux kernel menggunakan pustaka Rust murni (`aya` / `libbpf-rs`) untuk melacak throughput socket, RTT, dan penurunan paket intra-host tanpa dependensi LLVM/Clang saat runtime.
 
 ### 4. Konsekuensi
 * **Positif**:
   * Memenuhi target MTTD < 3 detik untuk infrastruktur tulang punggung modern.
   * Nol *blind spots* pada armada perangkat warisan tanpa membebani CPU perangkat tua.
   * Visibilitas *east-west traffic* internal server tercapai tanpa memasang proxy berat.
+  * Parsing paket berkecepatan tinggi dengan jaminan keamanan memori murni di tingkat sistem.
 * **Negatif & Mitigasi**:
-  * Membutuhkan normalisasi skema data (data parsing layer) untuk menyatukan data SNMP MIB dan OpenConfig YANG models ke dalam format canonical payload.
+  * Membutuhkan normalisasi skema data (data parsing layer) untuk menyatukan data SNMP MIB dan OpenConfig YANG models ke dalam format canonical payload Protobuf.
 
 ---
 
@@ -106,7 +108,7 @@ Pipeline ingesti harus mampu menyerap minimal **1.000.000 metrik/detik** dengan 
 ### 3. Keputusan
 Memilih **Opsi C**:
 * **Vector**: Ditempatkan di edge/collector tier untuk parsing, filtering, deduplikasi, dan transformasi data telemetri dengan performa tinggi (berbasis Rust, memory-safe).
-* **Apache Kafka**: Berfungsi sebagai buffer terdistribusi berkecepatan tinggi dengan *partitioning key* berbasis `device_id` / `site_id` untuk memastikan penjaminan urutan pesan (*ordered event stream*).
+* **Apache Kafka**: Berfungsi sebagai buffer terdistribusi berkecepatan tinggi dengan *partitioning key* berbasis `device_id` / `site_id` untuk memastikan penjaminan urutan pesan (*ordered event stream*). Konsumen internal mengonsumsi data secara asinkron via Rust (`rdkafka`).
 
 ### 4. Konsekuensi
 * **Positif**:
@@ -133,15 +135,16 @@ Konfigurasi jaringan secara manual berbasis CLI rentan terhadap *human error* da
 
 ### 3. Keputusan
 Memilih **Opsi B**:
-1. **Single Source of Truth (Git)**: Seluruh status konfigurasi jaringan didefinisikan secara deklaratif (misal: intent YAML/JSON berbasis OpenConfig) di repositori Git terlacak.
-2. **Orkestrasi Alur Kerja (Temporal Engine)**: Eksekusi perubahan, validasi pra/pasca-penerapan (*canary verification*), rollback instan, dan alur pemulihan mandiri dijalankan sebagai *Temporal Workflows* yang memiliki sifat *resilient, retryable*, dan *stateful*.
-3. **Flapping Suppression Mechanism**: Menerapkan *hold-down timer* wajib (misal: 30 detik stabilitas link tanpa interupsi) sebelum failback lalu lintas ke jalur utama.
+1. **Single Source of Truth (Git)**: Seluruh status konfigurasi jaringan didefinisikan secara deklaratif (misal: intent YAML/JSON berbasis OpenConfig) di repositori Git terlacak, dikelola langsung menggunakan pustaka thread-safe Git di Rust (`gix` / `git2`).
+2. **Orkestrasi Alur Kerja (Temporal Engine)**: Eksekusi perubahan, validasi pra/pasca-penerapan (*canary verification*), rollback instan, dan alur pemulihan mandiri dijalankan sebagai *Temporal Workflows* melalui **Rust Temporal SDK Core / Worker** yang memiliki sifat *resilient, retryable*, dan *stateful*.
+3. **Flapping Suppression Mechanism**: Menerapkan *hold-down timer* wajib (misal: 30 detik stabilitas link tanpa interupsi) dengan timer terisolasi di Rust sebelum failback lalu lintas ke jalur utama.
 
 ### 4. Konsekuensi
 * **Positif**:
   * Riwayat perubahan konfigurasi 100% terlacak (*immutable audit trail*).
   * Pemulihan otomatis (*reconciliation loop*) mampu mengembalikan konfigurasi menyimpang dalam hitungan detik.
   * Meniadakan risiko terhentinya alur automasi di tengah jalan saat terjadi restart server orkestrator (keunggulan persistensi Temporal).
+  * Eksekusi worker alur kerja hemat memori dan deterministik tanpa beban runtime interpreter.
 * **Negatif & Mitigasi**:
   * Kurva pembelajaran tim operasional terhadap paradigma GitOps dan Temporal SDK. Disediakan GUI portal konfigurasi untuk Network Engineer Tier 1-2.
 
@@ -162,13 +165,14 @@ Saat kabel transmisi utama atau switch core mengalami down, ratusan perangkat do
 
 ### 3. Keputusan
 Memilih **Opsi B**:
-1. **Graph Traversal RCA**: Saat alarm diterima, engine mengidentifikasi posisi simpul pada Graph Database. Jika simpul induk (*parent link*) berstatus *DOWN*, seluruh alarm dari simpul turunan (*children*) otomatis diagregasikan ke dalam satu tiket insiden utama (*suppressed/impacted*).
+1. **Graph Traversal RCA (Rust Engine)**: Saat alarm diterima, engine korelasi berbasis Rust (`neo4rs` over Tokio) mengidentifikasi posisi simpul pada Graph Database. Jika simpul induk (*parent link*) berstatus *DOWN*, seluruh alarm dari simpul turunan (*children*) otomatis diagregasikan ke dalam satu tiket insiden utama (*suppressed/impacted*) dalam waktu sub-10ms.
 2. **Predictive Time-Series Anomaly Detection**: Menerapkan model deteksi anomali pada metrik tren (suhu optik laser, kenaikan jitter, buffer drop) sebelum terjadi *hard down*, memicu peringatan proaktif (*early warning*).
 
 ### 4. Konsekuensi
 * **Positif**:
   * Mencapai target reduksi kebisingan alarm $\ge 85\%$.
   * Tiket insiden langsung menunjuk simpul sumber akar masalah (*root cause*), bukan korban turunan.
+  * Eksekusi traversal graf bebas dari latensi jeda Garbage Collector saat badai ribuan alarm masuk bersamaan.
 * **Negatif & Mitigasi**:
   * Ketergantungan pada akurasi topologi graf. Diminimalisasi melalui protokol *Auto-Discovery* berkelanjutan (LLDP/CDP/BGP) yang menyinkronkan graf secara real-time.
 
@@ -222,12 +226,12 @@ Di sisi lain, mengoperasikan cluster SSO terpisah yang berat (seperti Keycloak) 
 
 ### 3. Keputusan
 Memilih **Opsi C**: Mengimplementasikan **Autentikasi Mandiri Berbasis Basis Data (Internal / Custom Auth)**:
-1. **Penyimpanan Kredensial Mandiri**: Menyimpan kredensial pengguna langsung di database internal PostgreSQL dengan hashing password **Argon2id** (tahan serangan GPU/ASIC).
+1. **Penyimpanan Kredensial Mandiri**: Menyimpan kredensial pengguna langsung di database internal PostgreSQL dengan hashing password **Argon2id** (tahan serangan GPU/ASIC via Rust `argon2` crate).
 2. **Manajemen Sesi & Token**:
-   * Token akses stateless menggunakan **JWT** dengan masa aktif singkat (15 menit).
-   * *Rotating Refresh Token* (7 hari) yang divalidasi silang terhadap *session revocation blacklist* di **Redis** untuk memungkinkan terminasi sesi seketika (*instant force logout*).
-3. **MFA Mandiri (TOTP)**: Mendukung autentikasi 2 faktor berbasis **TOTP (RFC 6238)** dengan secret terenkripsi AES-256-GCM tanpa perlu gateway SMS/email pihak ketiga.
-4. **Proteksi Akses**: Menerapkan *rate limiting* dan pencegahan brute-force (*progressive account lock*) di level API Gateway via Redis.
+   * Token akses stateless menggunakan **JWT** via pustaka Rust `jsonwebtoken` dengan masa aktif singkat (15 menit).
+   * *Rotating Refresh Token* (7 hari) yang divalidasi silang terhadap *session revocation blacklist* di **Redis** via `fred` untuk memungkinkan terminasi sesi seketika (*instant force logout*).
+3. **MFA Mandiri (TOTP)**: Mendukung autentikasi 2 faktor berbasis **TOTP (RFC 6238)** via Rust `totp-rs` dengan secret terenkripsi **AES-256-GCM** (`aes-gcm` crate) tanpa perlu gateway SMS/email pihak ketiga.
+4. **Proteksi Akses**: Menerapkan *rate limiting* dan pencegahan brute-force (*progressive account lock*) di level API Gateway Rust (`axum`) via Redis.
 
 ### 4. Konsekuensi
 * **Positif**:
@@ -236,4 +240,36 @@ Memilih **Opsi C**: Mengimplementasikan **Autentikasi Mandiri Berbasis Basis Dat
   * Latensi Login Rendah: Verifikasi autentikasi selesai dalam waktu $< 50$ milidetik tanpa *network round-trip* ke server SSO eksternal.
   * Arsitektur Ringan: Menggunakan PostgreSQL dan Redis yang sudah menjadi dependensi utama sistem.
 * **Negatif & Mitigasi**:
-  * Tanggung jawab pengelolaan siklus hidup keamanan berada di tangan tim internal: Dimitigasi dengan menggunakan pustaka kriptografi resmi yang teruji (`golang.org/x/crypto/argon2`, `pquerna/otp`, `golang-jwt/jwt/v5`), enforcing password policy ketat, dan audit berkala.
+  * Tanggung jawab pengelolaan siklus hidup keamanan berada di tangan tim internal: Dimitigasi dengan menggunakan pustaka kriptografi resmi Rust yang telah diaudit ketat (`argon2`, `totp-rs`, `jsonwebtoken`, `aes-gcm`), menegakkan kebijakan kata sandi yang ketat, dan audit log otomatis.
+
+---
+
+## ADR-008: Standarisasi Bahasa Backend, Layanan Ingesti, dan Engine Inti Menggunakan Rust
+
+* **Status**: Accepted
+* **Tanggal**: 2026-10-10
+* **Pengambil Keputusan**: Chief Architect, Systems Lead & Core Engineering Team
+
+### 1. Konteks & Masalah
+Sistem NMS ditargetkan menyerap $\ge 1.000.000$ titik metrik per detik dengan latensi transmisi $< 500$ milidetik secara konsisten, bahkan di tengah lonjakan trafik badai alarm. Evaluasi terhadap runtime dengan *garbage collector* (GC) menunjukkan adanya risiko lonjakan *tail latency* (p99/p99.9) akibat siklus GC pauses pada beban kerja ekstrem, serta *memory footprint* yang membesar saat menangani jutaan struktur data per detik. Selain itu, parsing paket protokol biner (SNMP, Flow) dan integrasi probe kernel Linux (eBPF) memerlukan performa tingkat sistem dengan jaminan keamanan memori (*memory safety*) mutlak tanpa kompromi.
+
+### 2. Pilihan yang Dipertimbangkan
+* **Opsi A**: Mempertahankan Go 1.23 dengan optimasi manual alokasi objek (`sync.Pool`, memory arena).
+* **Opsi B**: Migrasi ke C++20 untuk engine pengumpul data.
+* **Opsi C**: Standardisasi seluruh layanan backend (kolektor, ingester, gateway, topology engine, dan reconciler) menggunakan **Rust (edisi 2024 / 1.82+)**.
+
+### 3. Keputusan
+Memilih **Opsi C**: Mengadopsi **Rust** sebagai bahasa resmi seluruh komponen backend dan komputasi inti:
+1. **Layanan Kolektor & Ingesti**: Dibangun dengan Rust menggunakan runtime asinkron **Tokio**, client gRPC **Tonic**, dan parser zero-copy berbasis **Nom**.
+2. **Sensor Kernel eBPF**: Dikelola langsung melalui framework Rust murni **Aya** tanpa ketergantungan pada toolchain C eksternal saat eksekusi.
+3. **Topology Engine & API Gateway**: Menggunakan **Axum** untuk perutean HTTP/WebSocket, **Neo4rs** untuk traversal graf, dan **Sqlx** untuk validasi skema SQL PostgreSQL pada fase kompilasi (*compile-time checked queries*).
+4. **GitOps & Orkestrasi**: Dijalankan menggunakan **Rust Temporal SDK Core** dan pustaka Git murni **Gix**.
+
+### 4. Konsekuensi
+* **Positif**:
+  * *Nol GC Pauses*: Menghilangkan fluktuasi latensi akibat pembersihan memori, menjamin SLA transmisi sub-500 milidetik pada beban puncak.
+  * *Efisiensi Memori Maksimal*: Pengurangan konsumsi RAM sebesar 50–70% dibanding runtime ber-GC, memungkinkan densitas kontainer yang lebih tinggi.
+  * *Type-Safety & Fearless Concurrency*: Sistem *ownership* dan *type system* Rust mengeliminasi potensi *data races* dan *nil-pointer dereference* sebelum biner dikompilasi.
+* **Negatif & Mitigasi**:
+  * Durasi kompilasi (*build time*) lebih lama: Dimitigasi dengan modularisasi crate via Cargo Workspace dan pemanfaatan shared compilation cache (`sccache`).
+  * Kurva pembelajaran tim: Dimitigasi dengan pedoman arsitektur terstruktur, pola asinkron standar berbasis Tokio/Axum, dan penegakan *linting* otomatis via `clippy`.
